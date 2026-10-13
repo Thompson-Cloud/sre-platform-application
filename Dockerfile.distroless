@@ -1,0 +1,31 @@
+
+# Stage 1: Install application dependencies
+FROM dhi.io/python:3.12-alpine3.24-dev@sha256:650454f603cab69381338f1fe6f3aa6ad5a27ebf7f350a14eb3478de603bd4db AS builder
+
+WORKDIR /app
+
+COPY requirements.txt .
+
+RUN python -m pip install \
+    --no-cache-dir \
+    --target=/app/deps \
+    -r requirements.txt
+
+
+# Stage 2: Minimal, non-root production runtime
+FROM dhi.io/python:3.12-alpine3.24@sha256:05727331e04033241be63907535da64779540a00e3ae02edb8fc824e3803e532 AS runtime
+
+WORKDIR /app
+
+COPY --from=builder /app/deps /app/deps
+COPY app.py /app/app.py
+
+ENV PYTHONPATH=/app/deps \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+    USER 65532:65532    
+
+EXPOSE 8080
+
+CMD ["python", "-m", "gunicorn", "--bind", "0.0.0.0:8080", "--workers", "1", "--threads", "2", "--access-logfile", "-", "app:app"]
