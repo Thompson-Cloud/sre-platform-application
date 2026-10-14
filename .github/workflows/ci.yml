@@ -39,7 +39,6 @@ jobs:
   container-security:
     name: Build and Scan Container
     runs-on: ubuntu-latest
-    needs: test
 
     steps:
       - name: Checkout repository
@@ -65,7 +64,13 @@ jobs:
   publish-ecr:
     name: Publish Image to Amazon ECR
     runs-on: ubuntu-latest
-    needs: container-security
+    needs:
+      - test
+      - container-security
+
+    outputs:
+      image_repository: ${{ steps.login-ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY_NAME }}
+      image_tag: ${{ github.sha }}
 
     # Enable only after AWS infrastructure is provisioned.
     if: ${{ false }}
@@ -101,3 +106,84 @@ jobs:
 
           docker push \
             "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+  update-gitops:
+    name: Update GitOps Image Tag
+    runs-on: ubuntu-latest
+    needs: publish-ecr
+
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.publish-ecr.result == 'success' }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Generate GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: Thompson-Cloud
+          repositories: sre-platform-gitops
+
+      - name: Checkout GitOps repository
+        uses: actions/checkout@v4
+        with:
+          repository: Thompson-Cloud/sre-platform-gitops
+          token: ${{ steps.app-token.outputs.token }}
+          path: gitops
+          persist-credentials: false
+
+      - name: Update dev image tag
+        env:
+          IMAGE_TAG: ${{ needs.publish-ecr.outputs.image_tag }}
+          IMAGE_REPOSITORY: ${{ needs.publish-ecr.outputs.image_repository }}
+        run: |
+          cd gitops
+
+          python3 - "$IMAGE_REPOSITORY" "$IMAGE_TAG" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          repository, tag = sys.argv[1:]
+
+          path = pathlib.Path("apps/sre-api/overlays/dev/kustomization.yaml")
+          content = path.read_text()
+
+          name_pattern = r"(?m)^([ \t]*newName:[ \t]*).+$"
+          tag_pattern = r"(?m)^([ \t]*newTag:[ \t]*).+$"
+
+          if len(re.findall(name_pattern, content)) != 1:
+              raise SystemExit("Expected exactly one newName field")
+
+          if len(re.findall(tag_pattern, content)) != 1:
+              raise SystemExit("Expected exactly one newTag field")
+
+          content = re.sub(name_pattern, lambda m: m.group(1) + repository, content)
+          content = re.sub(tag_pattern, lambda m: m.group(1) + tag, content)
+
+          path.write_text(content)
+          PY
+
+      - name: Commit and push GitOps update
+        env:
+          GH_APP_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          cd gitops
+
+          git config user.name "thompson-sre-gitops-bot[bot]"
+          git config user.email "5310179+thompson-sre-gitops-bot[bot]@users.noreply.github.com"
+
+          git add apps/sre-api/overlays/dev/kustomization.yaml
+
+          if git diff --cached --quiet; then
+            echo "No GitOps changes to commit"
+            exit 0
+          fi
+
+          git commit -m "chore(gitops): deploy image ${{ needs.publish-ecr.outputs.image_tag }}"
+
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_APP_TOKEN" | base64 -w0)" \
+            push origin HEAD:main
